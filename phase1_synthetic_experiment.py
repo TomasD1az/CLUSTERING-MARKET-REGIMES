@@ -169,7 +169,7 @@ def run_phase1_synthetic(
     h1: int = 20,
     stride_values: list = None,
     n_clusters: int = 3,
-    lambda_switch: float = 0.5,
+    lambda_switch: float = 0.6,
     random_state: int = 42,
     output_dir: str = "figures"
 ) -> None:
