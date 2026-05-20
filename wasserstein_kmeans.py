@@ -58,8 +58,8 @@ def create_sliding_windows(returns: np.ndarray, h1: int, h2: int) -> List[np.nda
     Returns:
         List of return windows (each is an empirical distribution)
     """
-    if h2 >= h1:
-        raise ValueError("h2 must be less than h1")
+    if h2 > h1:
+        raise ValueError("h2 must be less than or equal to h1")
 
     windows = []
     i = 0
@@ -656,3 +656,185 @@ def order_clusters_by_variance(
     new_centroids = [centroids[order[i]] for i in range(len(centroids))]
 
     return new_labels, new_centroids
+
+
+class TemporalWassersteinKMeans:
+    """
+    Wasserstein k-means with temporal persistence regularization.
+
+    Minimizes OT emission cost plus a switch penalty between consecutive windows.
+    """
+
+    def __init__(
+        self,
+        n_clusters: int = 2,
+        p: int = 1,
+        max_iter: int = 50,
+        tol: float = 1e-6,
+        n_init: int = 5,
+        lambda_switch: float = 1.0,
+        random_state: Optional[int] = None
+    ):
+        self.n_clusters = n_clusters
+        self.p = p
+        self.max_iter = max_iter
+        self.tol = tol
+        self.n_init = n_init
+        self.lambda_switch = lambda_switch
+        self.random_state = random_state
+
+        self.centroids_: Optional[List[np.ndarray]] = None
+        self.labels_: Optional[np.ndarray] = None
+        self.n_iter_: int = 0
+        self.inertia_: float = np.inf
+        self.loss_history_: List[float] = []
+
+    def _init_centroids(
+        self,
+        distributions: List[np.ndarray],
+        rng: np.random.Generator
+    ) -> List[np.ndarray]:
+        indices = rng.choice(len(distributions), size=self.n_clusters, replace=False)
+        return [np.sort(distributions[i].copy()) for i in indices]
+
+    def _compute_distance_matrix(
+        self,
+        distributions: List[np.ndarray],
+        centroids: List[np.ndarray]
+    ) -> np.ndarray:
+        n_steps = len(distributions)
+        n_clusters = len(centroids)
+        dists = np.zeros((n_steps, n_clusters))
+        for t, dist in enumerate(distributions):
+            for k, centroid in enumerate(centroids):
+                dists[t, k] = wasserstein_distance_1d(dist, centroid, self.p)
+        return dists
+
+    def _assign_clusters_temporal(
+        self,
+        dists: np.ndarray
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Viterbi-style assignment with switch penalty.
+        """
+        n_steps, n_clusters = dists.shape
+        dp = np.zeros((n_steps, n_clusters))
+        prev = np.full((n_steps, n_clusters), -1, dtype=int)
+
+        dp[0] = dists[0]
+
+        for t in range(1, n_steps):
+            prev_vals = dp[t - 1]
+            if n_clusters == 1:
+                dp[t, 0] = dists[t, 0] + prev_vals[0]
+                prev[t, 0] = 0
+                continue
+
+            order = np.argsort(prev_vals)
+            best_idx = int(order[0])
+            best_val = prev_vals[best_idx]
+            second_idx = int(order[1])
+            second_val = prev_vals[second_idx]
+
+            for k in range(n_clusters):
+                stay = prev_vals[k]
+                if k == best_idx:
+                    switch = second_val + self.lambda_switch
+                    switch_from = second_idx
+                else:
+                    switch = best_val + self.lambda_switch
+                    switch_from = best_idx
+
+                if stay <= switch:
+                    dp[t, k] = dists[t, k] + stay
+                    prev[t, k] = k
+                else:
+                    dp[t, k] = dists[t, k] + switch
+                    prev[t, k] = switch_from
+
+        labels = np.zeros(n_steps, dtype=int)
+        labels[-1] = int(np.argmin(dp[-1]))
+        for t in range(n_steps - 1, 0, -1):
+            labels[t - 1] = prev[t, labels[t]]
+
+        total_cost = dp[-1, labels[-1]]
+        return labels, total_cost
+
+    def _update_centroids(
+        self,
+        distributions: List[np.ndarray],
+        labels: np.ndarray,
+        centroids: List[np.ndarray]
+    ) -> List[np.ndarray]:
+        new_centroids = []
+        for k in range(self.n_clusters):
+            cluster_dists = [distributions[i] for i in range(len(distributions)) if labels[i] == k]
+            if len(cluster_dists) == 0:
+                new_centroids.append(centroids[k])
+            else:
+                new_centroids.append(wasserstein_barycenter_1d(cluster_dists, self.p))
+        return new_centroids
+
+    def _centroid_shift(
+        self,
+        old_centroids: List[np.ndarray],
+        new_centroids: List[np.ndarray]
+    ) -> float:
+        return sum(
+            wasserstein_distance_1d(old, new, self.p)
+            for old, new in zip(old_centroids, new_centroids)
+        )
+
+    def fit(self, distributions: List[np.ndarray]) -> 'TemporalWassersteinKMeans':
+        rng = np.random.default_rng(self.random_state)
+
+        best_cost = np.inf
+        best_centroids = None
+        best_labels = None
+        best_n_iter = 0
+        best_loss_history = []
+
+        for _ in range(self.n_init):
+            centroids = self._init_centroids(distributions, rng)
+            loss_history = []
+
+            for iteration in range(self.max_iter):
+                dists = self._compute_distance_matrix(distributions, centroids)
+                labels, total_cost = self._assign_clusters_temporal(dists)
+                loss_history.append(total_cost)
+
+                new_centroids = self._update_centroids(distributions, labels, centroids)
+                shift = self._centroid_shift(centroids, new_centroids)
+                centroids = new_centroids
+
+                if shift < self.tol:
+                    break
+
+            dists = self._compute_distance_matrix(distributions, centroids)
+            labels, total_cost = self._assign_clusters_temporal(dists)
+
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_centroids = centroids
+                best_labels = labels
+                best_n_iter = iteration + 1
+                best_loss_history = loss_history
+
+        self.centroids_ = best_centroids
+        self.labels_ = best_labels
+        self.n_iter_ = best_n_iter
+        self.inertia_ = best_cost
+        self.loss_history_ = best_loss_history
+
+        return self
+
+    def predict(self, distributions: List[np.ndarray]) -> np.ndarray:
+        if self.centroids_ is None:
+            raise ValueError("Model not fitted. Call fit() first.")
+        dists = self._compute_distance_matrix(distributions, self.centroids_)
+        labels, _ = self._assign_clusters_temporal(dists)
+        return labels
+
+    def fit_predict(self, distributions: List[np.ndarray]) -> np.ndarray:
+        self.fit(distributions)
+        return self.labels_
